@@ -2,7 +2,7 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="UTF-8">
-<title>通話收音工具</title>
+<title>通話收音工具 V3</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"></script>
 <style>
   body{font-family:"Microsoft JhengHei","PingFang TC",sans-serif;background:#1a1a1a;color:#eee;display:flex;flex-direction:column;align-items:center;padding:40px 20px;margin:0;}
@@ -15,6 +15,14 @@
   button{width:100%;padding:18px;border:none;border-radius:10px;font-size:18px;font-weight:bold;cursor:pointer;box-sizing:border-box;}
   #btnRecord{background:#e53935;color:white;}
   #btnRecord.recording{background:#555;}
+  .upload-box{display:none;width:100%;max-width:420px;flex-direction:column;gap:10px;margin-bottom:16px;}
+  .upload-box.show{display:flex;}
+  #noteInput{padding:12px;border-radius:8px;border:1px solid #444;background:#111;color:#eee;font-size:15px;box-sizing:border-box;}
+  #btnUpload{background:#6a1b9a;color:white;font-size:16px;padding:16px;}
+  #btnUpload:disabled{background:#444;cursor:not-allowed;}
+  #result{display:none;background:#2a2a2a;border-radius:12px;padding:16px;width:100%;max-width:420px;margin-bottom:16px;box-sizing:border-box;font-size:14px;line-height:1.7;}
+  #result.show{display:block;}
+  #result h3{margin:10px 0 4px;font-size:15px;color:#ce93d8;}
   .dl-btns{display:none;width:100%;max-width:420px;flex-direction:column;gap:10px;margin-bottom:16px;}
   .dl-btns.show{display:flex;}
   #btnWebm{background:#1565c0;color:white;font-size:15px;padding:14px;}
@@ -26,8 +34,8 @@
 </style>
 </head>
 <body>
-  <h1>📞 通話收音工具</h1>
-  <div class="sub">免安裝任何軟體，誰的電腦都能用<br>只支援 Windows + Chrome / Edge</div>
+  <h1>📞 通話收音工具 V3</h1>
+  <div class="sub">錄完一鍵上傳，AI 自動彙整會議記錄<br>只支援 Windows + Chrome / Edge</div>
 
   <div class="note">
     ⚠️ 點下方按鈕後，瀏覽器會跳出選擇視窗：<br>
@@ -42,14 +50,23 @@
     <button id="btnRecord" style="margin-top:14px;">● 開始錄音</button>
   </div>
 
+  <div class="upload-box" id="uploadBox">
+    <input id="noteInput" type="text" placeholder="會議備註（選填，例如：補開）">
+    <button id="btnUpload">☁ 上傳分析（逐字稿＋彙整）</button>
+  </div>
+
+  <div id="result"></div>
+
   <div class="dl-btns" id="dlBtns">
     <button id="btnWebm">⬇ 下載 .webm（備份）</button>
-    <button id="btnMp3">⬇ 轉成 MP3，上傳 NotebookLM</button>
+    <button id="btnMp3">⬇ 下載 MP3（備援）</button>
   </div>
 
   <div id="status">尚未開始</div>
 
 <script>
+const GAS_URL = '請貼上GAS部署網址';  // 部署 GAS Web App 後，把 /exec 網址貼到這裡
+
 let audioCtx, analyser, source, mediaRecorder, displayStream, audioOnlyStream;
 let chunks = [];
 let recording = false;
@@ -57,6 +74,7 @@ let startTime;
 let rafId;
 let recordedBlob = null;
 let recordedDuration = 0;
+let uploadedFileId = null;
 
 const btnRecord = document.getElementById('btnRecord');
 const levelBar  = document.getElementById('levelBar');
@@ -64,16 +82,25 @@ const status    = document.getElementById('status');
 const dlBtns    = document.getElementById('dlBtns');
 const btnWebm   = document.getElementById('btnWebm');
 const btnMp3    = document.getElementById('btnMp3');
+const uploadBox = document.getElementById('uploadBox');
+const noteInput = document.getElementById('noteInput');
+const btnUpload = document.getElementById('btnUpload');
+const resultBox = document.getElementById('result');
 
 btnRecord.onclick = async () => {
   if (!recording) { await startRecording(); } else { stopRecording(); }
 };
-btnWebm.onclick = () => downloadBlob(recordedBlob, 'webm');
-btnMp3.onclick  = async () => { await convertAndDownloadMP3(); };
+btnWebm.onclick  = () => downloadBlob(recordedBlob, 'webm');
+btnMp3.onclick   = async () => { await convertAndDownloadMP3(); };
+btnUpload.onclick = uploadAndAnalyze;
 
 async function startRecording() {
   dlBtns.classList.remove('show');
+  uploadBox.classList.remove('show');
+  resultBox.classList.remove('show');
+  resultBox.innerHTML = '';
   recordedBlob = null;
+  uploadedFileId = null;
 
   try {
     displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
@@ -147,10 +174,11 @@ function onRecordStop() {
   recordedBlob = new Blob(chunks, { type: 'audio/webm' });
   const m = String(Math.floor(recordedDuration / 60)).padStart(2, '0');
   const s = String(recordedDuration % 60).padStart(2, '0');
-  status.innerHTML = `<span class="ok">錄音完成（時長 ${m}:${s}）</span>`;
+  status.innerHTML = `<span class="ok">錄音完成（時長 ${m}:${s}），可上傳分析</span>`;
+  uploadBox.classList.add('show');
   dlBtns.classList.add('show');
   btnMp3.disabled = false;
-  btnMp3.textContent = '⬇ 轉成 MP3，上傳 NotebookLM';
+  btnMp3.textContent = '⬇ 下載 MP3（備援）';
 }
 
 function downloadBlob(blob, ext) {
@@ -158,66 +186,123 @@ function downloadBlob(blob, ext) {
   const a = document.createElement('a');
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   a.href = url;
-  a.download = '通話錄音_' + ts + '.' + ext;
+  a.download = '會議錄音_' + ts + '.' + ext;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
 
+// webm → 16kHz 單聲道 32kbps MP3
+async function encodeMp3(webmBlob) {
+  const arrayBuffer = await webmBlob.arrayBuffer();
+  const decCtx = new AudioContext();
+  const audioBuffer = await decCtx.decodeAudioData(arrayBuffer);
+  await decCtx.close();
+
+  const targetRate = 16000;
+  const offlineCtx = new OfflineAudioContext(1, Math.ceil(audioBuffer.duration * targetRate), targetRate);
+  const src = offlineCtx.createBufferSource();
+  src.buffer = audioBuffer;
+  src.connect(offlineCtx.destination);
+  src.start(0);
+  const rendered = await offlineCtx.startRendering();
+
+  const floatSamples = rendered.getChannelData(0);
+  const int16 = new Int16Array(floatSamples.length);
+  for (let i = 0; i < floatSamples.length; i++) {
+    const s = Math.max(-1, Math.min(1, floatSamples[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+
+  const encoder = new lamejs.Mp3Encoder(1, targetRate, 32);
+  const mp3Parts = [];
+  const chunkSize = 1152;
+  for (let i = 0; i < int16.length; i += chunkSize) {
+    const encoded = encoder.encodeBuffer(int16.subarray(i, i + chunkSize));
+    if (encoded.length > 0) mp3Parts.push(new Uint8Array(encoded));
+  }
+  const flushed = encoder.flush();
+  if (flushed.length > 0) mp3Parts.push(new Uint8Array(flushed));
+  return new Blob(mp3Parts, { type: 'audio/mpeg' });
+}
+
 async function convertAndDownloadMP3() {
   btnMp3.disabled = true;
   btnMp3.textContent = '⏳ 轉換中，請稍候...';
-  status.innerHTML = '<span class="ok">正在轉成 MP3（32kbps 語音品質），請稍候...</span>';
-
   try {
-    // 解碼 webm
-    const arrayBuffer = await recordedBlob.arrayBuffer();
-    const decCtx = new AudioContext();
-    const audioBuffer = await decCtx.decodeAudioData(arrayBuffer);
-    await decCtx.close();
-
-    // 重新採樣到 16kHz 單聲道
-    const targetRate = 16000;
-    const offlineCtx = new OfflineAudioContext(1, Math.ceil(audioBuffer.duration * targetRate), targetRate);
-    const src = offlineCtx.createBufferSource();
-    src.buffer = audioBuffer;
-    src.connect(offlineCtx.destination);
-    src.start(0);
-    const rendered = await offlineCtx.startRendering();
-
-    // Float32 → Int16
-    const floatSamples = rendered.getChannelData(0);
-    const int16 = new Int16Array(floatSamples.length);
-    for (let i = 0; i < floatSamples.length; i++) {
-      const s = Math.max(-1, Math.min(1, floatSamples[i]));
-      int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-
-    // lamejs 編碼 MP3
-    const encoder = new lamejs.Mp3Encoder(1, targetRate, 32);
-    const mp3Parts = [];
-    const chunkSize = 1152;
-    for (let i = 0; i < int16.length; i += chunkSize) {
-      const chunk = int16.subarray(i, i + chunkSize);
-      const encoded = encoder.encodeBuffer(chunk);
-      if (encoded.length > 0) mp3Parts.push(new Uint8Array(encoded));
-    }
-    const flushed = encoder.flush();
-    if (flushed.length > 0) mp3Parts.push(new Uint8Array(flushed));
-
-    const mp3Blob = new Blob(mp3Parts, { type: 'audio/mpeg' });
+    const mp3Blob = await encodeMp3(recordedBlob);
     downloadBlob(mp3Blob, 'mp3');
-
     const sizeMB = (mp3Blob.size / 1024 / 1024).toFixed(1);
-    status.innerHTML = `<span class="ok">MP3 已下載（${sizeMB} MB），可直接上傳 NotebookLM</span>`;
-    btnMp3.textContent = '⬇ 轉成 MP3，上傳 NotebookLM';
-    btnMp3.disabled = false;
+    status.innerHTML = `<span class="ok">MP3 已下載（${sizeMB} MB）</span>`;
   } catch(e) {
     status.innerHTML = '<span class="warn">轉換失敗：' + e.message + '</span>';
-    btnMp3.textContent = '⬇ 轉成 MP3，上傳 NotebookLM';
-    btnMp3.disabled = false;
   }
+  btnMp3.textContent = '⬇ 下載 MP3（備援）';
+  btnMp3.disabled = false;
+}
+
+// ---------- 上傳與分析 ----------
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+async function gasPost(obj) {
+  const res = await fetch(GAS_URL, { method: 'POST', body: JSON.stringify(obj) });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || '後端回傳錯誤');
+  return data;
+}
+
+async function uploadAndAnalyze() {
+  if (GAS_URL.indexOf('http') !== 0) {
+    status.innerHTML = '<span class="warn">尚未設定 GAS 網址（用記事本開啟本檔案，把 GAS_URL 換成部署網址）</span>';
+    return;
+  }
+  btnUpload.disabled = true;
+  try {
+    if (!uploadedFileId) {
+      status.innerHTML = '<span class="ok">轉檔中…</span>';
+      const mp3Blob = await encodeMp3(recordedBlob);
+      status.innerHTML = '<span class="ok">上傳中…（' + (mp3Blob.size / 1048576).toFixed(1) + ' MB）</span>';
+      const b64 = await blobToBase64(mp3Blob);
+      const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
+      const up = await gasPost({ action: 'upload', filename: '會議錄音_' + ts + '.mp3', data: b64 });
+      uploadedFileId = up.fileId;
+    }
+    status.innerHTML = '<span class="ok">AI 分析中…約 2～4 分鐘，請勿關閉頁面</span>';
+    const res = await gasPost({ action: 'analyze', fileId: uploadedFileId, note: noteInput.value.trim() });
+    renderResult(res);
+    status.innerHTML = '<span class="ok">完成！已寫入 Sheet 與會議記錄</span>';
+    uploadedFileId = null;
+  } catch (e) {
+    status.innerHTML = '<span class="warn">失敗：' + e.message +
+      '\n（若已等超過 5 分鐘，後端可能已完成，請先到 Sheet 查看再決定是否重試）</span>';
+  } finally {
+    btnUpload.disabled = false;
+  }
+}
+
+function renderResult(res) {
+  let html = '<h3>會議摘要</h3><div>' + escapeHtml(res.summary || '') + '</div>';
+  (res.customers || []).forEach(c => {
+    html += '<h3>' + escapeHtml(c.name) + '</h3><ul style="margin:4px 0;padding-left:20px;">';
+    (c.points || []).forEach(p => html += '<li>' + escapeHtml(p) + '</li>');
+    (c.todos || []).forEach(t => html += '<li>【待辦】' + escapeHtml(t) + '</li>');
+    html += '</ul>';
+  });
+  resultBox.innerHTML = html;
+  resultBox.classList.add('show');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 </script>
 </body>
