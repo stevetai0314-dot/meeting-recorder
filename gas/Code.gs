@@ -122,7 +122,7 @@ function geminiTranscribe(file) {
     { inlineData: { mimeType: 'audio/mpeg', data: b64 } },
     { text: '這是一段台灣外銷部門的中文會議錄音。請輸出完整逐字稿（繁體中文）。' +
             '不需要時間碼，不要加標題或評論，直接輸出逐字稿本文。' }
-  ]);
+  ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 65536 });
 }
 
 function geminiSummarize(transcript) {
