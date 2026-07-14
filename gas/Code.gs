@@ -91,7 +91,7 @@ function handleAnalyze(req) {
 
 // ---------- Gemini ----------
 
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent';
 
 function geminiCall(parts, generationConfig) {
   const key = PROPS.getProperty('GEMINI_API_KEY');
