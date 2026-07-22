@@ -75,6 +75,14 @@ let rafId;
 let recordedBlob = null;
 let recordedDuration = 0;
 let uploadedFileId = null;
+let unsavedWork = false;
+
+window.addEventListener('beforeunload', (e) => {
+  if (unsavedWork) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
 
 const btnRecord = document.getElementById('btnRecord');
 const levelBar  = document.getElementById('levelBar');
@@ -101,6 +109,7 @@ async function startRecording() {
   resultBox.innerHTML = '';
   recordedBlob = null;
   uploadedFileId = null;
+  unsavedWork = false;
 
   try {
     displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
@@ -128,6 +137,7 @@ async function startRecording() {
   mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
   mediaRecorder.onstop = onRecordStop;
   mediaRecorder.start();
+  unsavedWork = true;
 
   displayStream.getVideoTracks()[0].onended = () => { if (recording) stopRecording(); };
 
@@ -191,6 +201,7 @@ function downloadBlob(blob, ext) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+  unsavedWork = false; // 已下載到本機，錄音不會遺失
 }
 
 // webm → 16kHz 單聲道 32kbps MP3
@@ -275,6 +286,7 @@ async function uploadAndAnalyze() {
       const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
       const up = await gasPost({ action: 'upload', filename: '會議錄音_' + ts + '.mp3', data: b64 });
       uploadedFileId = up.fileId;
+      unsavedWork = false; // 已上傳存進 Drive，錄音不會遺失
     }
     status.innerHTML = '<span class="ok">AI 分析中…約 2～4 分鐘，請勿關閉頁面</span>';
     const res = await gasPost({ action: 'analyze', fileId: uploadedFileId, note: noteInput.value.trim() });
