@@ -70,6 +70,7 @@
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbw226_CTXoKbMsXdrsNFqHAmACVpYdTMBzCmDioa8VT57u3V4PUTq5JWrMtKkiQxYUQsg/exec';
 
 let audioCtx, sysAnalyser, micAnalyser, mediaRecorder, displayStream, micStream;
+let micActive = false;
 let chunks = [];
 let recording = false;
 let startTime;
@@ -152,6 +153,7 @@ async function startRecording() {
   } else {
     micAnalyser = null;
   }
+  micActive = !!micAnalyser;
 
   chunks = [];
   mediaRecorder = new MediaRecorder(destination.stream);
@@ -166,7 +168,7 @@ async function startRecording() {
   startTime = Date.now();
   btnRecord.textContent = '■ 停止錄音';
   btnRecord.classList.add('recording');
-  status.innerHTML = micStream
+  status.innerHTML = micActive
     ? '<span class="ok">已抓到系統音訊與麥克風，錄音中</span>'
     : '<span class="warn">未取得麥克風權限，僅錄系統音訊，錄音中</span>';
   updateLevel();
@@ -192,7 +194,8 @@ function updateTimer() {
   const sec = Math.floor((Date.now() - startTime) / 1000);
   const m = String(Math.floor(sec / 60)).padStart(2, '0');
   const s = String(sec % 60).padStart(2, '0');
-  status.innerHTML = '<span class="ok">錄音中... ' + m + ':' + s + '</span>';
+  status.innerHTML = '<span class="ok">錄音中... ' + m + ':' + s + '</span>' +
+    (micActive ? '' : '<span class="warn">（未取得麥克風權限，僅錄系統音訊）</span>');
   setTimeout(updateTimer, 500);
 }
 
