@@ -2,7 +2,10 @@
 const PROPS = PropertiesService.getScriptProperties();
 const TZ = 'Asia/Taipei';
 
-function doGet() {
+function doGet(e) {
+  const action = e && e.parameter && e.parameter.action;
+  if (action === 'ping')        return jsonOut(handlePing());
+  if (action === 'healthcheck') return jsonOut(handleHealthcheck());
   return ContentService.createTextOutput('OK meeting-recorder v3');
 }
 
@@ -38,7 +41,7 @@ function getOrCreateFolder(name, propKey) {
   return folder;
 }
 
-function getSheet() {
+function getSpreadsheet() {
   const id = PROPS.getProperty('SHEET_ID');
   let ss = null;
   if (id) {
@@ -49,7 +52,41 @@ function getSheet() {
     PROPS.setProperty('SHEET_ID', ss.getId());
     ss.getSheets()[0].appendRow(['日期時間', '備註', '摘要', '逐字稿', 'MP3連結', 'MD連結', '狀態']);
   }
-  return ss.getSheets()[0];
+  return ss;
+}
+
+function getSheet() {
+  return getSpreadsheet().getSheets()[0];
+}
+
+function getGlossarySheet() {
+  const ss = getSpreadsheet();
+  let sheet = ss.getSheetByName('詞彙表');
+  if (!sheet) {
+    sheet = ss.insertSheet('詞彙表');
+    sheet.appendRow(['專有名詞', '備註（選填）']);
+  }
+  return sheet;
+}
+
+function getGlossaryTerms() {
+  const sheet = getGlossarySheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const values = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+  return values
+    .map(function (row) { return { term: String(row[0] || '').trim(), note: String(row[1] || '').trim() }; })
+    .filter(function (row) { return row.term.length > 0; });
+}
+
+function buildGlossaryBlock() {
+  const glossary = getGlossaryTerms();
+  if (!glossary.length) return '';
+  const lines = glossary.map(function (g) {
+    return g.note ? '- ' + g.term + '（' + g.note + '）' : '- ' + g.term;
+  });
+  return '以下是本次會議常見的專有名詞正確寫法，遇到發音相近或不確定的詞，請優先採用這些寫法，不要自行意譯、音譯或簡化：\n' +
+    lines.join('\n') + '\n\n';
 }
 
 function handleUpload(req) {
@@ -78,8 +115,10 @@ function handleAnalyze(req) {
     transcript = geminiTranscribe(file);
     result = geminiSummarize(transcript);
   } catch (err) {
-    sheet.appendRow([dateTimeStr, note, '', '', file.getUrl(), '',
-                     '待重新分析：' + String(err && err.message || err).slice(0, 200)]);
+    const msg = String(err && err.message || err);
+    const isQuota = msg.indexOf('429') !== -1 || msg.indexOf('RESOURCE_EXHAUSTED') !== -1;
+    const statusText = isQuota ? '配額用完，隔日重試' : ('待重新分析：' + msg.slice(0, 200));
+    sheet.appendRow([dateTimeStr, note, '', '', file.getUrl(), '', statusText]);
     throw err;
   }
 
@@ -91,7 +130,76 @@ function handleAnalyze(req) {
 
 // ---------- Gemini ----------
 
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent';
+const GEMINI_MODEL = 'gemini-3.5-flash';
+const GEMINI_BASE  = 'https://generativelanguage.googleapis.com/v1beta';
+const GEMINI_URL   = GEMINI_BASE + '/models/' + GEMINI_MODEL + ':generateContent';
+
+// ---------- API 健康檢查 ----------
+
+// 前端「測試 API」按鈕用：驗 key（免費）+ 打一個最小請求測配額
+function handleHealthcheck() {
+  const keyResult = checkGeminiKey();
+  if (!keyResult.keyValid) {
+    return { ok: true, keyValid: false, hasModel: false, quota: 'key_invalid', detail: keyResult.detail };
+  }
+  const quota = checkGeminiQuota();
+  return { ok: true, keyValid: true, hasModel: keyResult.hasModel, quota: quota.status, detail: quota.detail };
+}
+
+// 只驗 key，不吃 generateContent 配額
+function handlePing() {
+  const keyResult = checkGeminiKey();
+  return { ok: true, keyValid: keyResult.keyValid, hasModel: keyResult.hasModel, detail: keyResult.detail };
+}
+
+// 呼叫 models.list：跟 generateContent 分開的配額，等於免費
+function checkGeminiKey() {
+  const key = PROPS.getProperty('GEMINI_API_KEY');
+  if (!key) return { keyValid: false, hasModel: false, detail: '尚未設定 GEMINI_API_KEY' };
+  const res = UrlFetchApp.fetch(GEMINI_BASE + '/models?key=' + key, { method: 'get', muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+  if (code !== 200) {
+    return { keyValid: false, hasModel: false, detail: 'models.list ' + code + '：' + body.slice(0, 200) };
+  }
+  let hasModel = false;
+  try {
+    const data = JSON.parse(body);
+    hasModel = (data.models || []).some(function (m) {
+      return String(m.name || '').indexOf(GEMINI_MODEL) !== -1;
+    });
+  } catch (err) { /* 解析失敗就當作沒找到模型 */ }
+  return { keyValid: true, hasModel: hasModel, detail: hasModel ? '' : '找不到模型 ' + GEMINI_MODEL };
+}
+
+// 打一個最小的 generateContent，只看 HTTP 狀態碼判斷配額
+function checkGeminiQuota() {
+  const key = PROPS.getProperty('GEMINI_API_KEY');
+  if (!key) return { status: 'key_invalid', detail: '尚未設定 GEMINI_API_KEY' };
+  const payload = {
+    contents: [{ parts: [{ text: '回OK' }] }],
+    generationConfig: { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 5 }
+  };
+  const res = UrlFetchApp.fetch(GEMINI_URL + '?key=' + key, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+  if (code === 200) return { status: 'alive', detail: '' };
+  return classifyGeminiError(code, body);
+}
+
+function classifyGeminiError(code, body) {
+  const b = String(body || '');
+  if (code === 429) return { status: 'quota_exhausted', detail: '免費層配額已用完，通常美西午夜後重置（約台灣下午 3~4 點）' };
+  if (code === 404) return { status: 'model_unavailable', detail: '找不到模型 ' + GEMINI_MODEL };
+  if (code === 400 && b.indexOf('API_KEY_INVALID') !== -1) return { status: 'key_invalid', detail: 'API key 無效' };
+  if (code === 403) return { status: 'key_invalid', detail: 'API key 被拒（403）：' + b.slice(0, 150) };
+  return { status: 'error', detail: code + '：' + b.slice(0, 200) };
+}
 
 function geminiCall(parts, generationConfig) {
   const key = PROPS.getProperty('GEMINI_API_KEY');
@@ -118,18 +226,23 @@ function geminiCall(parts, generationConfig) {
 
 function geminiTranscribe(file) {
   const b64 = Utilities.base64Encode(file.getBlob().getBytes());
+  const glossaryBlock = buildGlossaryBlock();
   return geminiCall([
     { inlineData: { mimeType: 'audio/mpeg', data: b64 } },
-    { text: '這是一段台灣外銷部門的中文會議錄音。請輸出完整逐字稿（繁體中文）。' +
+    { text: glossaryBlock +
+            '這是一段台灣外銷部門的中文會議錄音。請輸出完整逐字稿（繁體中文）。' +
             '不需要時間碼，不要加標題或評論，直接輸出逐字稿本文。' }
   ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 65536 });
 }
 
 function geminiSummarize(transcript) {
+  const glossaryBlock = buildGlossaryBlock();
   const prompt =
+    glossaryBlock +
     '以下是外銷部會議逐字稿，會議內容是逐一討論多個客人。請整理成 JSON，格式：\n' +
     '{"summary":"整場會議 2~3 句摘要","customers":[{"name":"客人名稱","points":["重點"],"todos":["待辦事項"]}]}\n' +
-    '規則：客人名稱用逐字稿中出現的稱呼；沒有待辦就給空陣列；全部使用繁體中文；只輸出 JSON。\n\n' +
+    '規則：客人名稱用逐字稿中出現的稱呼；若上面列出專有名詞清單，內容中出現時請務必採用清單中的正確寫法；' +
+    '沒有待辦就給空陣列；全部使用繁體中文；只輸出 JSON。\n\n' +
     '逐字稿：\n' + transcript;
   const text = geminiCall([{ text: prompt }], { responseMimeType: 'application/json' });
   return JSON.parse(text);
@@ -187,9 +300,14 @@ function testUploadSkeleton() {
   Logger.log(getSheet().getRange(1, 1, 1, 7).getValues());
 }
 
-// 設好 GEMINI_API_KEY 後執行：期望 Logger 顯示「OK」
+// 設好 GEMINI_API_KEY 後執行：印出 key 檢查結果（免費，不吃 generateContent 配額）
 function testGeminiKey() {
-  Logger.log(geminiCall([{ text: '請只回覆OK兩個字' }]));
+  Logger.log(checkGeminiKey());
+}
+
+// 完整健康檢查：印出 key + 配額狀態（會打一個最小請求，吃 1 個免費層額度）
+function testHealthcheck() {
+  Logger.log(handleHealthcheck());
 }
 
 // 純函式測試：期望印出 MD 並顯示 PASS

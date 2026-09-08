@@ -31,11 +31,19 @@
   #status{margin-top:16px;font-size:14px;color:#aaa;text-align:center;white-space:pre-line;max-width:420px;}
   .ok{color:#4caf50;}
   .warn{color:#ffb300;}
+  #btnHealth{max-width:420px;background:#37474f;color:#fff;font-size:15px;padding:12px;margin-bottom:8px;}
+  #btnHealth:disabled{background:#444;cursor:not-allowed;}
+  #healthStatus{font-size:13px;color:#aaa;text-align:center;max-width:420px;margin-bottom:16px;white-space:pre-line;min-height:1em;}
+  #healthStatus.ok{color:#4caf50;}
+  #healthStatus.warn{color:#ffb300;}
 </style>
 </head>
 <body>
   <h1>📞 通話收音工具 V3</h1>
   <div class="sub">錄完一鍵上傳，AI 自動彙整會議記錄<br>只支援 Windows + Chrome / Edge</div>
+
+  <button id="btnHealth">🔍 測試 API（錄音前先確認 AI 還能用）</button>
+  <div id="healthStatus"></div>
 
   <div class="note">
     ⚠️ 點下方按鈕後，瀏覽器會跳出選擇視窗：<br>
@@ -98,6 +106,8 @@ const uploadBox = document.getElementById('uploadBox');
 const noteInput = document.getElementById('noteInput');
 const btnUpload = document.getElementById('btnUpload');
 const resultBox = document.getElementById('result');
+const btnHealth = document.getElementById('btnHealth');
+const healthStatus = document.getElementById('healthStatus');
 
 btnRecord.onclick = async () => {
   if (!recording) { await startRecording(); } else { stopRecording(); }
@@ -105,6 +115,43 @@ btnRecord.onclick = async () => {
 btnWebm.onclick  = () => downloadBlob(recordedBlob, 'webm');
 btnMp3.onclick   = async () => { await convertAndDownloadMP3(); };
 btnUpload.onclick = uploadAndAnalyze;
+btnHealth.onclick = checkApiHealth;
+
+async function checkApiHealth() {
+  if (GAS_URL.indexOf('http') !== 0) {
+    setHealth('warn', '尚未設定 GAS 網址');
+    return;
+  }
+  btnHealth.disabled = true;
+  setHealth('', '檢查中…');
+  try {
+    const res = await fetch(GAS_URL + '?action=healthcheck');
+    const d = await res.json();
+    if (!d.ok) {
+      setHealth('warn', '檢查失敗：' + (d.error || '未知錯誤'));
+    } else if (!d.keyValid || d.quota === 'key_invalid') {
+      setHealth('warn', '❌ API key 無效或未設定\n' + (d.detail || ''));
+    } else if (d.quota === 'alive') {
+      setHealth('ok', '✅ API 正常，可以錄音' +
+        (d.hasModel ? '' : '\n（models 清單找不到指定模型，但呼叫成功）'));
+    } else if (d.quota === 'quota_exhausted') {
+      setHealth('warn', '⚠️ key 正常，但今日免費配額已用完\n' + (d.detail || ''));
+    } else if (d.quota === 'model_unavailable') {
+      setHealth('warn', '❌ ' + (d.detail || '找不到模型'));
+    } else {
+      setHealth('warn', '⚠️ ' + (d.detail || '未知狀態'));
+    }
+  } catch (e) {
+    setHealth('warn', '連不到後端：' + e.message);
+  } finally {
+    btnHealth.disabled = false;
+  }
+}
+
+function setHealth(cls, msg) {
+  healthStatus.className = cls;
+  healthStatus.textContent = msg;
+}
 
 async function startRecording() {
   dlBtns.classList.remove('show');
