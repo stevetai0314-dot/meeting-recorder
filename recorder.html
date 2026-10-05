@@ -18,6 +18,9 @@
   .upload-box{display:none;width:100%;max-width:420px;flex-direction:column;gap:10px;margin-bottom:16px;}
   .upload-box.show{display:flex;}
   #noteInput{padding:12px;border-radius:8px;border:1px solid #444;background:#111;color:#eee;font-size:15px;box-sizing:border-box;}
+  #docInput{color:#ccc;font-size:14px;}
+  #docList{font-size:13px;color:#aaa;line-height:1.6;white-space:pre-line;}
+  #docList.warn{color:#ffb300;}
   #btnUpload{background:#6a1b9a;color:white;font-size:16px;padding:16px;}
   #btnUpload:disabled{background:#444;cursor:not-allowed;}
   #result{display:none;background:#2a2a2a;border-radius:12px;padding:16px;width:100%;max-width:420px;margin-bottom:16px;box-sizing:border-box;font-size:14px;line-height:1.7;}
@@ -62,6 +65,9 @@
 
   <div class="upload-box" id="uploadBox">
     <input id="noteInput" type="text" placeholder="會議備註（選填，例如：補開）">
+    <label for="docInput" style="font-size:13px;color:#888;">討論文件（PDF，可多選，選填，合計 15MB 以內）</label>
+    <input id="docInput" type="file" accept="application/pdf" multiple>
+    <div id="docList"></div>
     <button id="btnUpload">☁ 上傳分析（逐字稿＋彙整）</button>
   </div>
 
@@ -86,6 +92,8 @@ let rafId;
 let recordedBlob = null;
 let recordedDuration = 0;
 let uploadedFileId = null;
+const MAX_DOC_BYTES = 15 * 1024 * 1024;
+let uploadedDocIds = {}; // docKey → Drive fileId，失敗重按時不重傳
 let unsavedWork = false;
 
 window.addEventListener('beforeunload', (e) => {
@@ -104,6 +112,8 @@ const btnWebm   = document.getElementById('btnWebm');
 const btnMp3    = document.getElementById('btnMp3');
 const uploadBox = document.getElementById('uploadBox');
 const noteInput = document.getElementById('noteInput');
+const docInput  = document.getElementById('docInput');
+const docList   = document.getElementById('docList');
 const btnUpload = document.getElementById('btnUpload');
 const resultBox = document.getElementById('result');
 const btnHealth = document.getElementById('btnHealth');
@@ -115,6 +125,7 @@ btnRecord.onclick = async () => {
 btnWebm.onclick  = () => downloadBlob(recordedBlob, 'webm');
 btnMp3.onclick   = async () => { await convertAndDownloadMP3(); };
 btnUpload.onclick = uploadAndAnalyze;
+docInput.onchange = renderDocList;
 btnHealth.onclick = checkApiHealth;
 
 async function checkApiHealth() {
@@ -160,6 +171,11 @@ async function startRecording() {
   resultBox.innerHTML = '';
   recordedBlob = null;
   uploadedFileId = null;
+  docInput.value = '';
+  docList.textContent = '';
+  docList.className = '';
+  uploadedDocIds = {};
+  btnUpload.disabled = false;
   unsavedWork = false;
 
   try {
@@ -356,6 +372,8 @@ async function uploadAndAnalyze() {
     status.innerHTML = '<span class="warn">尚未設定 GAS 網址（用記事本開啟本檔案，把 GAS_URL 換成部署網址）</span>';
     return;
   }
+  const docErr = checkDocs();
+  if (docErr) { status.innerHTML = '<span class="warn">' + escapeHtml(docErr) + '</span>'; return; }
   btnUpload.disabled = true;
   try {
     if (!uploadedFileId) {
@@ -368,17 +386,51 @@ async function uploadAndAnalyze() {
       uploadedFileId = up.fileId;
       unsavedWork = false; // 已上傳存進 Drive，錄音不會遺失
     }
+    const docFiles = Array.from(docInput.files);
+    const docFileIds = [];
+    for (let i = 0; i < docFiles.length; i++) {
+      const f = docFiles[i];
+      const key = docKey(f);
+      if (!uploadedDocIds[key]) {
+        status.innerHTML = '<span class="ok">上傳文件 ' + (i + 1) + '/' + docFiles.length + '：' + escapeHtml(f.name) + '</span>';
+        const upDoc = await gasPost({ action: 'upload', filename: f.name, mimeType: 'application/pdf', data: await blobToBase64(f) });
+        uploadedDocIds[key] = upDoc.fileId;
+      }
+      docFileIds.push(uploadedDocIds[key]);
+    }
     status.innerHTML = '<span class="ok">AI 分析中…約 2～4 分鐘，請勿關閉頁面</span>';
-    const res = await gasPost({ action: 'analyze', fileId: uploadedFileId, note: noteInput.value.trim() });
+    const res = await gasPost({ action: 'analyze', fileId: uploadedFileId, docFileIds: docFileIds, note: noteInput.value.trim() });
     renderResult(res);
     status.innerHTML = '<span class="ok">完成！已寫入 Sheet 與會議記錄</span>';
     uploadedFileId = null;
+    uploadedDocIds = {};
   } catch (e) {
     status.innerHTML = '<span class="warn">失敗：' + e.message +
       '\n（若已等超過 5 分鐘，後端可能已完成，請先到 Sheet 查看再決定是否重試）</span>';
   } finally {
     btnUpload.disabled = false;
   }
+}
+
+function docKey(f) { return f.name + '|' + f.size + '|' + f.lastModified; }
+
+// 回傳錯誤訊息；沒問題回空字串
+function checkDocs() {
+  const files = Array.from(docInput.files);
+  const bad = files.filter(f => f.type !== 'application/pdf');
+  if (bad.length) return '只能上傳 PDF：' + bad.map(f => f.name).join('、');
+  const total = files.reduce((s, f) => s + f.size, 0);
+  if (total > MAX_DOC_BYTES) return 'PDF 合計 ' + (total / 1048576).toFixed(1) + ' MB，超過 15 MB 上限';
+  return '';
+}
+
+function renderDocList() {
+  const files = Array.from(docInput.files);
+  const err = checkDocs();
+  docList.className = err ? 'warn' : '';
+  docList.textContent = files.map(f => '📄 ' + f.name + '（' + (f.size / 1048576).toFixed(1) + ' MB）').join('\n') +
+    (err ? '\n⚠️ ' + err : '');
+  btnUpload.disabled = !!err;
 }
 
 function renderResult(res) {
@@ -389,6 +441,11 @@ function renderResult(res) {
     (c.todos || []).forEach(t => html += '<li>【待辦】' + escapeHtml(t) + '</li>');
     html += '</ul>';
   });
+  if ((res.undiscussed || []).length) {
+    html += '<h3>文件有、會議未討論</h3><ul style="margin:4px 0;padding-left:20px;">';
+    res.undiscussed.forEach(u => html += '<li>' + escapeHtml(u.doc) + '：' + escapeHtml(u.item) + '</li>');
+    html += '</ul>';
+  }
   resultBox.innerHTML = html;
   resultBox.classList.add('show');
 }
