@@ -110,9 +110,11 @@ function handleAnalyze(req) {
   const dateTimeStr = Utilities.formatDate(now, TZ, 'yyyy-MM-dd HH:mm');
   const sheet = getSheet();
 
-  let transcript, result;
+  let transcript, warnings, result;
   try {
-    transcript = geminiTranscribe(file);
+    const t = geminiTranscribe(file);
+    transcript = t.text;
+    warnings = t.warnings;
     result = geminiSummarize(transcript);
   } catch (err) {
     const msg = String(err && err.message || err);
@@ -124,7 +126,8 @@ function handleAnalyze(req) {
 
   const md = buildMarkdown(dateStr, note, result);
   const mdFile = saveMarkdown(dateStr, now, md);
-  appendRecord(sheet, dateTimeStr, note, result, transcript, file, mdFile);
+  const statusText = warnings.length ? '完成（逐字稿可能不完整：' + warnings.join('、') + '）' : '完成';
+  appendRecord(sheet, dateTimeStr, note, result, transcript, file, mdFile, statusText);
   return { ok: true, summary: result.summary, customers: result.customers || [], mdUrl: mdFile.getUrl() };
 }
 
@@ -201,17 +204,22 @@ function classifyGeminiError(code, body) {
   return { status: 'error', detail: code + '：' + b.slice(0, 200) };
 }
 
-function geminiCall(parts, generationConfig) {
+function geminiRequest(parts, generationConfig) {
   const key = PROPS.getProperty('GEMINI_API_KEY');
   if (!key) throw new Error('尚未設定 GEMINI_API_KEY（GAS 左側「專案設定」→ 指令碼屬性）');
   const payload = { contents: [{ parts: parts }] };
   if (generationConfig) payload.generationConfig = generationConfig;
-  const res = UrlFetchApp.fetch(GEMINI_URL + '?key=' + key, {
+  return {
+    url: GEMINI_URL + '?key=' + key,
     method: 'post',
     contentType: 'application/json',
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
-  });
+  };
+}
+
+// 回傳 { text, finishReason }；HTTP 錯誤或沒內容就丟例外
+function parseGeminiResponse(res) {
   const code = res.getResponseCode();
   const body = res.getContentText();
   if (code !== 200) throw new Error('Gemini API 錯誤 ' + code + '：' + body.slice(0, 300));
@@ -221,18 +229,116 @@ function geminiCall(parts, generationConfig) {
     ? cand.content.parts.map(function (p) { return p.text || ''; }).join('')
     : '';
   if (!text) throw new Error('Gemini 沒有回傳內容：' + body.slice(0, 300));
-  return text;
+  return { text: text, finishReason: (cand && cand.finishReason) || '' };
 }
 
+function geminiCall(parts, generationConfig) {
+  const req = geminiRequest(parts, generationConfig);
+  return parseGeminiResponse(UrlFetchApp.fetch(req.url, req)).text;
+}
+
+// ---------- 分段轉逐字稿 ----------
+// 長音檔一次丟給 Gemini 容易整段跳過，所以切成短段平行轉寫再接起來
+
+const CHUNK_SECONDS   = 600; // 每段 10 分鐘
+const OVERLAP_SECONDS = 5;   // 段與段重疊幾秒，避免切斷句子
+const MIN_TAIL_SECONDS = 60; // 最後一段短於此就併入前一段
+
+const MP3_BITRATES = {
+  v1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+  v2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+};
+const MP3_SAMPLE_RATES = { 3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000] };
+
+// 解析 i 位置的 MP3 Layer III frame 標頭，不是合法標頭回 null
+function parseMp3Header(bytes, i) {
+  if (i + 4 > bytes.length) return null;
+  const b0 = bytes[i] & 0xFF, b1 = bytes[i + 1] & 0xFF, b2 = bytes[i + 2] & 0xFF;
+  if (b0 !== 0xFF || (b1 & 0xE0) !== 0xE0) return null;
+  const version = (b1 >> 3) & 0x03;          // 3=MPEG1, 2=MPEG2, 0=MPEG2.5
+  const layer = (b1 >> 1) & 0x03;            // 1=Layer III
+  if (version === 1 || layer !== 1) return null;
+  const brIdx = (b2 >> 4) & 0x0F, srIdx = (b2 >> 2) & 0x03, pad = (b2 >> 1) & 0x01;
+  if (brIdx === 0 || brIdx === 15 || srIdx === 3) return null;
+  const kbps = (version === 3 ? MP3_BITRATES.v1 : MP3_BITRATES.v2)[brIdx];
+  const sampleRate = MP3_SAMPLE_RATES[version][srIdx];
+  const frameSize = Math.floor((version === 3 ? 144 : 72) * kbps * 1000 / sampleRate) + pad;
+  return { frameSize: frameSize, bytesPerSec: kbps * 1000 / 8 };
+}
+
+// 從 pos 往後找第一個 frame 起點（連續兩個合法標頭才算，避免誤判音訊資料）
+function findFrameStart(bytes, pos) {
+  for (let i = Math.max(0, pos); i < bytes.length - 4; i++) {
+    const h = parseMp3Header(bytes, i);
+    if (!h) continue;
+    if (i + h.frameSize >= bytes.length || parseMp3Header(bytes, i + h.frameSize)) return i;
+  }
+  return bytes.length;
+}
+
+// 把 CBR MP3 切成 [{ startSec, bytes }]，切點都落在 frame 起點
+function splitMp3(bytes) {
+  const first = findFrameStart(bytes, 0);
+  const header = parseMp3Header(bytes, first);
+  if (!header) return [{ startSec: 0, bytes: bytes }];
+  const bps = header.bytesPerSec;
+  const totalSec = (bytes.length - first) / bps;
+  let count = Math.ceil(totalSec / CHUNK_SECONDS);
+  if (count > 1 && totalSec - (count - 1) * CHUNK_SECONDS < MIN_TAIL_SECONDS) count--;
+  if (count <= 1) return [{ startSec: 0, bytes: bytes }];
+
+  const chunks = [];
+  for (let k = 0; k < count; k++) {
+    const startSec = k === 0 ? 0 : k * CHUNK_SECONDS - OVERLAP_SECONDS;
+    const start = k === 0 ? 0 : findFrameStart(bytes, first + Math.floor(startSec * bps));
+    const end = k === count - 1 ? bytes.length
+      : findFrameStart(bytes, first + Math.floor((k + 1) * CHUNK_SECONDS * bps));
+    chunks.push({ startSec: startSec, bytes: bytes.slice(start, end) });
+  }
+  return chunks;
+}
+
+function formatMmSs(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+
+// 回傳 { text, warnings[] }；warnings 記錄哪一段沒有正常結束
 function geminiTranscribe(file) {
-  const b64 = Utilities.base64Encode(file.getBlob().getBytes());
+  const chunks = splitMp3(file.getBlob().getBytes());
   const glossaryBlock = buildGlossaryBlock();
-  return geminiCall([
-    { inlineData: { mimeType: 'audio/mpeg', data: b64 } },
-    { text: glossaryBlock +
-            '這是一段台灣外銷部門的中文會議錄音。請輸出完整逐字稿（繁體中文）。' +
-            '不需要時間碼，不要加標題或評論，直接輸出逐字稿本文。' }
-  ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 65536 });
+  const requests = chunks.map(function (c, idx) {
+    const where = chunks.length === 1 ? '' :
+      '這是整場會議的第 ' + (idx + 1) + '/' + chunks.length + ' 段（約從 ' + formatMmSs(c.startSec) + ' 開始）' +
+      (idx > 0 ? '，開頭約 ' + OVERLAP_SECONDS + ' 秒與上一段重疊' : '') + '。';
+    return geminiRequest([
+      { inlineData: { mimeType: 'audio/mpeg', data: Utilities.base64Encode(c.bytes) } },
+      { text: glossaryBlock +
+              '這是一段台灣外銷部門的中文會議錄音。' + where +
+              '請從頭到尾逐句完整轉寫成繁體中文逐字稿，每一句發言都要寫出來，' +
+              '不可省略、不可摘要、不可跳過任何段落；聽不清楚的地方寫［聽不清］。' +
+              '換人講話時換行。不需要時間碼，不要加標題或評論，直接輸出逐字稿本文。' }
+    ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 16384 });
+  });
+
+  const responses = UrlFetchApp.fetchAll(requests);
+  const warnings = [];
+  const parts = responses.map(function (res, idx) {
+    let r;
+    try {
+      r = parseGeminiResponse(res);
+    } catch (err) {
+      // 429 配額用完就直接失敗；其他錯誤（如 503 忙線）單段重試一次
+      if (res.getResponseCode() === 429) throw err;
+      r = parseGeminiResponse(UrlFetchApp.fetch(requests[idx].url, requests[idx]));
+    }
+    if (r.finishReason && r.finishReason !== 'STOP') {
+      warnings.push('第' + (idx + 1) + '段 ' + r.finishReason);
+    }
+    return chunks.length === 1 ? r.text
+      : '【第 ' + (idx + 1) + ' 段，約 ' + formatMmSs(chunks[idx].startSec) + ' 起】\n' + r.text.trim();
+  });
+  return { text: parts.join('\n\n'), warnings: warnings };
 }
 
 function geminiSummarize(transcript) {
@@ -281,12 +387,12 @@ function formatSummaryCell(result) {
   return s;
 }
 
-function appendRecord(sheet, dateTimeStr, note, result, transcript, mp3File, mdFile) {
+function appendRecord(sheet, dateTimeStr, note, result, transcript, mp3File, mdFile, statusText) {
   const t = transcript.length > 45000
     ? transcript.slice(0, 45000) + '\n…(過長截斷，完整內容請聽 MP3)'
     : transcript;
   sheet.appendRow([dateTimeStr, note, formatSummaryCell(result), t,
-                   mp3File.getUrl(), mdFile.getUrl(), '完成']);
+                   mp3File.getUrl(), mdFile.getUrl(), statusText]);
 }
 
 // ---------- 測試函式（在 GAS 編輯器手動執行） ----------
