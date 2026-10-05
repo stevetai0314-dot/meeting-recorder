@@ -356,7 +356,17 @@ function geminiSummarize(transcript) {
 
 // ---------- MD 與 Sheet ----------
 
-function buildMarkdown(dateStr, note, result) {
+function normalizeUndiscussed(result) {
+  return Array.isArray(result && result.undiscussed) ? result.undiscussed : [];
+}
+
+// MD 連結文字裡的方括號會讓連結失效，換成全形
+function mdLinkText(name) {
+  return String(name).replace(/\[/g, '［').replace(/\]/g, '］');
+}
+
+function buildMarkdown(dateStr, note, result, docs) {
+  docs = docs || [];
   let md = '---\ndate: ' + dateStr + '\ntype: 外銷部會議\n---\n\n# 外銷部會議 ' + dateStr + '\n\n';
   if (note) md += '> 備註：' + note + '\n\n';
   if (result.summary) md += result.summary + '\n\n';
@@ -366,7 +376,22 @@ function buildMarkdown(dateStr, note, result) {
     (c.todos || []).forEach(function (t) { md += '- 待辦：' + t + '\n'; });
     md += '\n';
   });
+  if (docs.length) {
+    md += '## 會議文件\n';
+    docs.forEach(function (d) { md += '- [' + mdLinkText(d.name) + '](' + d.url + ')\n'; });
+    md += '\n';
+    const undiscussed = normalizeUndiscussed(result);
+    if (undiscussed.length) {
+      md += '## 文件有、會議未討論\n';
+      undiscussed.forEach(function (u) { md += '- ' + u.doc + '：' + u.item + '\n'; });
+      md += '\n';
+    }
+  }
   return md;
+}
+
+function formatDocLinks(docs) {
+  return (docs || []).map(function (d) { return d.name + ' ' + d.url; }).join('\n');
 }
 
 function saveMarkdown(dateStr, now, md) {
@@ -426,4 +451,28 @@ function testBuildMarkdown() {
   if (md.indexOf('## [[ABC公司]]') === -1) throw new Error('客人段落格式錯誤');
   if (md.indexOf('- 待辦：寄色卡') === -1) throw new Error('待辦格式錯誤');
   Logger.log('testBuildMarkdown PASS');
+}
+
+// 純函式測試：附文件時有兩個新段落；檔名方括號轉全形；沒附文件時與現行相同
+function testBuildMarkdownWithDocs() {
+  const result = {
+    summary: '測試摘要。',
+    customers: [{ name: 'ABC公司', points: ['報價 USD 1.2/碼'], todos: [] }],
+    undiscussed: [{ doc: '報價單[ABC].pdf', item: '第 3 項交期' }]
+  };
+  const docs = [{ name: '報價單[ABC].pdf', url: 'https://drive.google.com/x' }];
+  const md = buildMarkdown('2026-10-05', '', result, docs);
+  Logger.log(md);
+  if (md.indexOf('## 會議文件\n- [報價單［ABC］.pdf](https://drive.google.com/x)') === -1) throw new Error('會議文件段落錯誤');
+  if (md.indexOf('## 文件有、會議未討論\n- 報價單[ABC].pdf：第 3 項交期') === -1) throw new Error('未討論段落錯誤');
+
+  const plain = buildMarkdown('2026-10-05', '', { summary: 'a', customers: [] });
+  if (plain.indexOf('會議文件') !== -1 || plain.indexOf('未討論') !== -1) throw new Error('沒附文件卻出現文件段落');
+
+  const noField = buildMarkdown('2026-10-05', '', { summary: 'a', customers: [], undiscussed: 'x' }, docs);
+  if (noField.indexOf('未討論') !== -1) throw new Error('undiscussed 非陣列時應略過');
+
+  if (formatDocLinks(docs) !== '報價單[ABC].pdf https://drive.google.com/x') throw new Error('formatDocLinks 錯誤');
+  if (formatDocLinks([]) !== '') throw new Error('formatDocLinks 空陣列應回空字串');
+  Logger.log('testBuildMarkdownWithDocs PASS');
 }
