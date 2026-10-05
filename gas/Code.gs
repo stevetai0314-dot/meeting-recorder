@@ -50,13 +50,16 @@ function getSpreadsheet() {
   if (!ss) {
     ss = SpreadsheetApp.create('外銷部會議記錄');
     PROPS.setProperty('SHEET_ID', ss.getId());
-    ss.getSheets()[0].appendRow(['日期時間', '備註', '摘要', '逐字稿', 'MP3連結', 'MD連結', '狀態']);
+    ss.getSheets()[0].appendRow(['日期時間', '備註', '摘要', '逐字稿', 'MP3連結', 'MD連結', '狀態', '文件連結']);
   }
   return ss;
 }
 
 function getSheet() {
-  return getSpreadsheet().getSheets()[0];
+  const sheet = getSpreadsheet().getSheets()[0];
+  // 舊試算表只有 7 欄表頭，補上第 8 欄
+  if (sheet.getRange(1, 8).getValue() === '') sheet.getRange(1, 8).setValue('文件連結');
+  return sheet;
 }
 
 function getGlossarySheet() {
@@ -93,9 +96,10 @@ function handleUpload(req) {
   if (!req.data) throw new Error('沒有收到音檔資料');
   const bytes = Utilities.base64Decode(req.data);
   if (bytes.length === 0) throw new Error('音檔是空的');
+  const mimeType = req.mimeType || 'audio/mpeg';
   const name = req.filename ||
     ('會議錄音_' + Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd_HH-mm') + '.mp3');
-  const blob = Utilities.newBlob(bytes, 'audio/mpeg', name);
+  const blob = Utilities.newBlob(bytes, mimeType, name);
   const folder = getOrCreateFolder('外銷部會議錄音', 'AUDIO_FOLDER_ID');
   const file = folder.createFile(blob);
   return { ok: true, fileId: file.getId(), sizeMB: (bytes.length / 1048576).toFixed(1) };
@@ -104,6 +108,9 @@ function handleUpload(req) {
 function handleAnalyze(req) {
   if (!req.fileId) throw new Error('缺少 fileId');
   const file = DriveApp.getFileById(req.fileId);
+  const docFiles = (req.docFileIds || []).map(function (id) { return DriveApp.getFileById(id); });
+  const docs = docFiles.map(function (f) { return { name: f.getName(), url: f.getUrl() }; });
+  const docLinks = formatDocLinks(docs);
   const note = req.note || '';
   const now = new Date();
   const dateStr = Utilities.formatDate(now, TZ, 'yyyy-MM-dd');
@@ -115,20 +122,21 @@ function handleAnalyze(req) {
     const t = geminiTranscribe(file);
     transcript = t.text;
     warnings = t.warnings;
-    result = geminiSummarize(transcript);
+    result = geminiSummarize(transcript, docFiles);
   } catch (err) {
     const msg = String(err && err.message || err);
     const isQuota = msg.indexOf('429') !== -1 || msg.indexOf('RESOURCE_EXHAUSTED') !== -1;
     const statusText = isQuota ? '配額用完，隔日重試' : ('待重新分析：' + msg.slice(0, 200));
-    sheet.appendRow([dateTimeStr, note, '', '', file.getUrl(), '', statusText]);
+    sheet.appendRow([dateTimeStr, note, '', '', file.getUrl(), '', statusText, docLinks]);
     throw err;
   }
 
-  const md = buildMarkdown(dateStr, note, result);
+  const md = buildMarkdown(dateStr, note, result, docs);
   const mdFile = saveMarkdown(dateStr, now, md);
   const statusText = warnings.length ? '完成（逐字稿可能不完整：' + warnings.join('、') + '）' : '完成';
-  appendRecord(sheet, dateTimeStr, note, result, transcript, file, mdFile, statusText);
-  return { ok: true, summary: result.summary, customers: result.customers || [], mdUrl: mdFile.getUrl() };
+  appendRecord(sheet, dateTimeStr, note, result, transcript, file, mdFile, statusText, docLinks);
+  return { ok: true, summary: result.summary, customers: result.customers || [],
+           undiscussed: result.undiscussed, mdUrl: mdFile.getUrl() };
 }
 
 // ---------- Gemini ----------
@@ -341,17 +349,31 @@ function geminiTranscribe(file) {
   return { text: parts.join('\n\n'), warnings: warnings };
 }
 
-function geminiSummarize(transcript) {
+function geminiSummarize(transcript, docFiles) {
+  docFiles = docFiles || [];
   const glossaryBlock = buildGlossaryBlock();
+  const docRules = docFiles.length
+    ? '本次會議附有討論文件（逐字稿之前的 PDF）。規則：以逐字稿為準整理客人重點與待辦；' +
+      '逐字稿提到文件內容時，從文件補上具體數字、品號、交期、規格；客人名稱、品名、品號一律採用文件寫法；' +
+      '文件中會議沒有討論到的內容不要寫進 customers，改列在 undiscussed（doc 填文件名稱）。\n'
+    : '';
   const prompt =
-    glossaryBlock +
+    glossaryBlock + docRules +
     '以下是外銷部會議逐字稿，會議內容是逐一討論多個客人。請整理成 JSON，格式：\n' +
-    '{"summary":"整場會議 2~3 句摘要","customers":[{"name":"客人名稱","points":["重點"],"todos":["待辦事項"]}]}\n' +
+    '{"summary":"整場會議 2~3 句摘要","customers":[{"name":"客人名稱","points":["重點"],"todos":["待辦事項"]}]' +
+    (docFiles.length ? ',"undiscussed":[{"doc":"文件名稱","item":"未討論的項目"}]' : '') + '}\n' +
     '規則：客人名稱用逐字稿中出現的稱呼；若上面列出專有名詞清單，內容中出現時請務必採用清單中的正確寫法；' +
     '沒有待辦就給空陣列；全部使用繁體中文；只輸出 JSON。\n\n' +
     '逐字稿：\n' + transcript;
-  const text = geminiCall([{ text: prompt }], { responseMimeType: 'application/json' });
-  return JSON.parse(text);
+  const parts = [];
+  docFiles.forEach(function (f) {
+    parts.push({ text: '文件名稱：' + f.getName() });
+    parts.push({ inlineData: { mimeType: 'application/pdf', data: Utilities.base64Encode(f.getBlob().getBytes()) } });
+  });
+  parts.push({ text: prompt });
+  const result = JSON.parse(geminiCall(parts, { responseMimeType: 'application/json' }));
+  result.undiscussed = normalizeUndiscussed(result);
+  return result;
 }
 
 // ---------- MD 與 Sheet ----------
@@ -412,12 +434,12 @@ function formatSummaryCell(result) {
   return s;
 }
 
-function appendRecord(sheet, dateTimeStr, note, result, transcript, mp3File, mdFile, statusText) {
+function appendRecord(sheet, dateTimeStr, note, result, transcript, mp3File, mdFile, statusText, docLinks) {
   const t = transcript.length > 45000
     ? transcript.slice(0, 45000) + '\n…(過長截斷，完整內容請聽 MP3)'
     : transcript;
   sheet.appendRow([dateTimeStr, note, formatSummaryCell(result), t,
-                   mp3File.getUrl(), mdFile.getUrl(), statusText]);
+                   mp3File.getUrl(), mdFile.getUrl(), statusText, docLinks || '']);
 }
 
 // ---------- 測試函式（在 GAS 編輯器手動執行） ----------
@@ -475,4 +497,25 @@ function testBuildMarkdownWithDocs() {
   if (formatDocLinks(docs) !== '報價單[ABC].pdf https://drive.google.com/x') throw new Error('formatDocLinks 錯誤');
   if (formatDocLinks([]) !== '') throw new Error('formatDocLinks 空陣列應回空字串');
   Logger.log('testBuildMarkdownWithDocs PASS');
+}
+
+// 舊試算表（只有 7 欄表頭）跑過 getSheet 後 H1 應為「文件連結」
+function testDocHeader() {
+  const sheet = getSheet();
+  const h = sheet.getRange(1, 8).getValue();
+  Logger.log('H1=' + h);
+  if (h !== '文件連結') throw new Error('第 8 欄表頭沒補上');
+  Logger.log('testDocHeader PASS');
+}
+
+// 真打 Gemini（吃 1 次額度）：拿 Drive 上一份 PDF 測整合摘要
+// 使用前把 TEST_PDF_ID 換成「外銷部會議錄音」資料夾裡任一 PDF 的檔案 ID
+function testSummarizeWithPdf() {
+  const TEST_PDF_ID = '請貼上PDF檔案ID';
+  const pdf = DriveApp.getFileById(TEST_PDF_ID);
+  const result = geminiSummarize('主管：我們看一下這份文件第一項，這個沒問題。', [pdf]);
+  Logger.log(JSON.stringify(result, null, 2));
+  if (!Array.isArray(result.customers)) throw new Error('customers 不是陣列');
+  if (!Array.isArray(normalizeUndiscussed(result))) throw new Error('undiscussed 處理錯誤');
+  Logger.log('testSummarizeWithPdf PASS');
 }
