@@ -94,6 +94,7 @@ let recordedDuration = 0;
 let uploadedFileId = null;
 const MAX_DOC_BYTES = 15 * 1024 * 1024;
 let uploadedDocIds = {}; // docKey → Drive fileId，失敗重按時不重傳
+let uploading = false;   // 上傳／分析進行中，避免改選文件後又能按一次
 let unsavedWork = false;
 
 window.addEventListener('beforeunload', (e) => {
@@ -374,6 +375,8 @@ async function uploadAndAnalyze() {
   }
   const docErr = checkDocs();
   if (docErr) { status.innerHTML = '<span class="warn">' + escapeHtml(docErr) + '</span>'; return; }
+  if (uploading) return;
+  uploading = true;
   btnUpload.disabled = true;
   try {
     if (!uploadedFileId) {
@@ -408,7 +411,8 @@ async function uploadAndAnalyze() {
     status.innerHTML = '<span class="warn">失敗：' + e.message +
       '\n（若已等超過 5 分鐘，後端可能已完成，請先到 Sheet 查看再決定是否重試）</span>';
   } finally {
-    btnUpload.disabled = false;
+    uploading = false;
+    btnUpload.disabled = !!checkDocs();
   }
 }
 
@@ -430,7 +434,7 @@ function renderDocList() {
   docList.className = err ? 'warn' : '';
   docList.textContent = files.map(f => '📄 ' + f.name + '（' + (f.size / 1048576).toFixed(1) + ' MB）').join('\n') +
     (err ? '\n⚠️ ' + err : '');
-  btnUpload.disabled = !!err;
+  btnUpload.disabled = !!err || uploading;
 }
 
 function renderResult(res) {
