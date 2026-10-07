@@ -230,6 +230,9 @@ function geminiRequest(parts, generationConfig) {
 function parseGeminiResponse(res) {
   const code = res.getResponseCode();
   const body = res.getContentText();
+  if (isBusyCode(code)) {
+    throw new Error('Gemini 伺服器忙線（' + code + '，已自動重試 ' + RETRY_WAITS_MS.length + ' 次），請過幾分鐘再按「上傳分析」');
+  }
   if (code !== 200) throw new Error('Gemini API 錯誤 ' + code + '：' + body.slice(0, 300));
   const data = JSON.parse(body);
   const cand = data.candidates && data.candidates[0];
@@ -240,9 +243,30 @@ function parseGeminiResponse(res) {
   return { text: text, finishReason: (cand && cand.finishReason) || '' };
 }
 
+// Gemini 忙線（5xx）時等一下再試；429 配額用完、400 參數錯誤重試也沒用，不重試
+const RETRY_WAITS_MS = [10000, 30000];
+
+function isBusyCode(code) {
+  return code === 500 || code === 502 || code === 503 || code === 504;
+}
+
+// 同時送出多個請求；忙線的那幾個等一下後只重送它們，回傳與 requests 同順序的回應
+function fetchAllWithRetry(requests) {
+  const responses = UrlFetchApp.fetchAll(requests);
+  for (let i = 0; i < RETRY_WAITS_MS.length; i++) {
+    const busy = [];
+    responses.forEach(function (res, idx) { if (isBusyCode(res.getResponseCode())) busy.push(idx); });
+    if (!busy.length) break;
+    Utilities.sleep(RETRY_WAITS_MS[i]);
+    const retried = UrlFetchApp.fetchAll(busy.map(function (idx) { return requests[idx]; }));
+    busy.forEach(function (idx, k) { responses[idx] = retried[k]; });
+  }
+  return responses;
+}
+
 function geminiCall(parts, generationConfig) {
   const req = geminiRequest(parts, generationConfig);
-  return parseGeminiResponse(UrlFetchApp.fetch(req.url, req)).text;
+  return parseGeminiResponse(fetchAllWithRetry([req])[0]).text;
 }
 
 // ---------- 分段轉逐字稿 ----------
@@ -329,17 +353,10 @@ function geminiTranscribe(file) {
     ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 16384 });
   });
 
-  const responses = UrlFetchApp.fetchAll(requests);
+  const responses = fetchAllWithRetry(requests);
   const warnings = [];
   const parts = responses.map(function (res, idx) {
-    let r;
-    try {
-      r = parseGeminiResponse(res);
-    } catch (err) {
-      // 429 配額用完就直接失敗；其他錯誤（如 503 忙線）單段重試一次
-      if (res.getResponseCode() === 429) throw err;
-      r = parseGeminiResponse(UrlFetchApp.fetch(requests[idx].url, requests[idx]));
-    }
+    const r = parseGeminiResponse(res);
     if (r.finishReason && r.finishReason !== 'STOP') {
       warnings.push('第' + (idx + 1) + '段 ' + r.finishReason);
     }
