@@ -135,6 +135,7 @@ function handleAnalyze(req) {
   const mdFile = saveMarkdown(dateStr, now, md);
   const statusText = warnings.length ? '完成（逐字稿可能不完整：' + warnings.join('、') + '）' : '完成';
   appendRecord(sheet, dateTimeStr, note, result, transcript, file, mdFile, statusText, docLinks);
+  clearChunkCache(file); // 全部完成，快取不再需要
   return { ok: true, summary: result.summary, customers: result.customers || [],
            undiscussed: result.undiscussed, mdUrl: mdFile.getUrl() };
 }
@@ -244,7 +245,8 @@ function parseGeminiResponse(res) {
 }
 
 // Gemini 忙線（5xx）時等一下再試；429 配額用完、400 參數錯誤重試也沒用，不重試
-const RETRY_WAITS_MS = [10000, 30000];
+// 等久一點比較容易等到伺服器恢復，也少算幾次請求（最壞多等 80 秒，仍在 GAS 6 分鐘上限內）
+const RETRY_WAITS_MS = [20000, 60000];
 
 function isBusyCode(code) {
   return code === 500 || code === 502 || code === 503 || code === 504;
@@ -335,33 +337,90 @@ function formatMmSs(sec) {
   return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
 }
 
+// ---------- 逐段快取 ----------
+// 轉寫成功的段落先存在 Drive 的小檔案裡；失敗重試時只補沒成功的段，不重複花錢。
+// 全部分析完成後由 clearChunkCache 刪掉快取檔。
+
+function chunkCacheName(file) {
+  return file.getId() + '.transcript-cache.json';
+}
+
+// 回傳 { file, data }；data 形如 { count: 4, parts: { "0": {text, finishReason}, ... } }
+function loadChunkCache(file, chunkCount) {
+  const folder = getOrCreateFolder('外銷部會議錄音', 'AUDIO_FOLDER_ID');
+  const it = folder.getFilesByName(chunkCacheName(file));
+  let cacheFile = null;
+  let data = { count: chunkCount, parts: {} };
+  if (it.hasNext()) {
+    cacheFile = it.next();
+    try {
+      const saved = JSON.parse(cacheFile.getBlob().getDataAsString());
+      if (saved && saved.count === chunkCount && saved.parts) data = saved; // 切段數不同就視為作廢
+    } catch (e) { /* 壞掉的快取就重來 */ }
+  }
+  return { file: cacheFile, folder: folder, data: data };
+}
+
+function saveChunkCache(cache, file) {
+  const json = JSON.stringify(cache.data);
+  if (cache.file) cache.file.setContent(json);
+  else cache.file = cache.folder.createFile(chunkCacheName(file), json, 'application/json');
+}
+
+function clearChunkCache(file) {
+  const folder = getOrCreateFolder('外銷部會議錄音', 'AUDIO_FOLDER_ID');
+  const it = folder.getFilesByName(chunkCacheName(file));
+  while (it.hasNext()) it.next().setTrashed(true);
+}
+
 // 回傳 { text, warnings[] }；warnings 記錄哪一段沒有正常結束
 function geminiTranscribe(file) {
   const chunks = splitMp3(file.getBlob().getBytes());
   const glossaryBlock = buildGlossaryBlock();
-  const requests = chunks.map(function (c, idx) {
-    const where = chunks.length === 1 ? '' :
-      '這是整場會議的第 ' + (idx + 1) + '/' + chunks.length + ' 段（約從 ' + formatMmSs(c.startSec) + ' 開始）' +
-      (idx > 0 ? '，開頭約 ' + OVERLAP_SECONDS + ' 秒與上一段重疊' : '') + '。';
-    return geminiRequest([
-      { inlineData: { mimeType: 'audio/mpeg', data: Utilities.base64Encode(c.bytes) } },
-      { text: glossaryBlock +
-              '這是一段台灣外銷部門的中文會議錄音。' + where +
-              '請從頭到尾逐句完整轉寫成繁體中文逐字稿，每一句發言都要寫出來，' +
-              '不可省略、不可摘要、不可跳過任何段落；聽不清楚的地方寫［聽不清］。' +
-              '換人講話時換行。不需要時間碼，不要加標題或評論，直接輸出逐字稿本文。' }
-    ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 16384 });
-  });
+  const cache = loadChunkCache(file, chunks.length);
 
-  const responses = fetchAllWithRetry(requests);
+  // 只送出還沒有結果的段落
+  const todo = [];
+  chunks.forEach(function (c, idx) { if (!cache.data.parts[idx]) todo.push(idx); });
+
+  if (todo.length) {
+    const requests = todo.map(function (idx) {
+      const c = chunks[idx];
+      const where = chunks.length === 1 ? '' :
+        '這是整場會議的第 ' + (idx + 1) + '/' + chunks.length + ' 段（約從 ' + formatMmSs(c.startSec) + ' 開始）' +
+        (idx > 0 ? '，開頭約 ' + OVERLAP_SECONDS + ' 秒與上一段重疊' : '') + '。';
+      return geminiRequest([
+        { inlineData: { mimeType: 'audio/mpeg', data: Utilities.base64Encode(c.bytes) } },
+        { text: glossaryBlock +
+                '這是一段台灣外銷部門的中文會議錄音。' + where +
+                '請從頭到尾逐句完整轉寫成繁體中文逐字稿，每一句發言都要寫出來，' +
+                '不可省略、不可摘要、不可跳過任何段落；聽不清楚的地方寫［聽不清］。' +
+                '換人講話時換行。不需要時間碼，不要加標題或評論，直接輸出逐字稿本文。' }
+      ], { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 16384 });
+    });
+
+    const responses = fetchAllWithRetry(requests);
+    let firstError = null;
+    responses.forEach(function (res, k) {
+      try {
+        const r = parseGeminiResponse(res);
+        cache.data.parts[todo[k]] = { text: r.text, finishReason: r.finishReason };
+      } catch (err) {
+        if (!firstError) firstError = err; // 成功的段落照樣存，最後再丟錯
+      }
+    });
+    saveChunkCache(cache, file);
+    if (firstError) throw firstError;
+  }
+
   const warnings = [];
-  const parts = responses.map(function (res, idx) {
-    const r = parseGeminiResponse(res);
+  const parts = chunks.map(function (c, idx) {
+    const r = cache.data.parts[idx];
     if (r.finishReason && r.finishReason !== 'STOP') {
       warnings.push('第' + (idx + 1) + '段 ' + r.finishReason);
     }
     return chunks.length === 1 ? r.text
-      : '【第 ' + (idx + 1) + ' 段，約 ' + formatMmSs(chunks[idx].startSec) + ' 起】\n' + r.text.trim();
+      : '【第 ' + (idx + 1) + ' 段，約 ' + formatMmSs(c.startSec) + ' 起】\n' + r.text.trim();
   });
   return { text: parts.join('\n\n'), warnings: warnings };
 }
@@ -388,7 +447,11 @@ function geminiSummarize(transcript, docFiles) {
     parts.push({ inlineData: { mimeType: 'application/pdf', data: Utilities.base64Encode(f.getBlob().getBytes()) } });
   });
   parts.push({ text: prompt });
-  const result = JSON.parse(geminiCall(parts, { responseMimeType: 'application/json' }));
+  // 摘要不需要深度推理，關掉思考以免思考 token 照輸出計費
+  const result = JSON.parse(geminiCall(parts, {
+    responseMimeType: 'application/json',
+    thinkingConfig: { thinkingBudget: 0 }
+  }));
   result.undiscussed = normalizeUndiscussed(result);
   return result;
 }
